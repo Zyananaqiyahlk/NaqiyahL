@@ -1,0 +1,41 @@
+# ─── SECRETS — NEVER commit these ───────────────────────────────────────────
+.env
+token.json
+credentials_oauth.json
+
+# ─── PERSONAL DATA ───────────────────────────────────────────────────────────
+data/conversations/
+data/leads.csv
+data/calendar.json
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# ─── macOS ───────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ─── IDEs ────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Audio temp files ────────────────────────────────────────────────────────
+*.mp3
+*.wav
+tts_*.mp3
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log

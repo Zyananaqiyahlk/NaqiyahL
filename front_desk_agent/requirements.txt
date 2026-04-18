@@ -1,0 +1,12 @@
+anthropic>=0.40.0
+SpeechRecognition>=3.10.0
+pyttsx3>=2.90
+gTTS>=2.5.0
+pygame>=2.5.0
+pyaudio>=0.2.13
+python-dotenv>=1.0.0
+requests>=2.31.0       # ElevenLabs TTS API calls
+
+# ─── Phase 1: Twilio phone server ──
+flask>=3.0.0
+twilio>=9.0.0

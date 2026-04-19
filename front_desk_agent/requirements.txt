@@ -5,8 +5,16 @@ gTTS>=2.5.0
 pygame>=2.5.0
 pyaudio>=0.2.13
 python-dotenv>=1.0.0
-requests>=2.31.0       # ElevenLabs TTS API calls
+requests>=2.31.0       # Apollo API calls
+edge-tts>=6.1.0        # Free Microsoft neural TTS — no API key needed
 
-# ─── Phase 1: Twilio phone server ──
+# ─── Phone server (Twilio inbound + Bland.ai outbound) ──────────────────────
 flask>=3.0.0
 twilio>=9.0.0
+gunicorn>=21.2.0       # Production WSGI server for Railway deployment
+psycopg2-binary>=2.9.9 # Postgres driver — Railway provides DATABASE_URL automatically
+
+# ─── Google Calendar sync ────────────────────────────────────────────────────
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1

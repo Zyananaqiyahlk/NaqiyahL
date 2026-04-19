@@ -94,17 +94,14 @@ CHALLENGE_TARGETS = {
 }
 
 # ─── TTS SETTINGS ─────────────────────────────────────────────────────────────
-# Priority order: elevenlabs → gtts → pyttsx3
-TTS_ENGINE   = "elevenlabs"  # "elevenlabs" | "gtts" | "pyttsx3"
+# Priority order: Edge TTS (free neural) → gTTS (online) → pyttsx3 (offline)
+# No API keys needed. Install edge-tts: pip install edge-tts
 TTS_LANGUAGE = "en"
 TTS_SLOW     = False
 
-# ElevenLabs settings (set ELEVENLABS_API_KEY in .env)
-# Voice options: https://api.elevenlabs.io/v1/voices
-ELEVENLABS_VOICE_ID    = "EXAVITQu4vr4xnSDxMaL"  # Sarah — professional female voice
-ELEVENLABS_MODEL       = "eleven_turbo_v2"          # Fast, low-latency model
-ELEVENLABS_STABILITY   = 0.5
-ELEVENLABS_SIMILARITY  = 0.8
+# Edge TTS voice — run `edge-tts --list-voices` for full list
+# Good options: en-CA-ClaraNeural, en-US-JennyNeural, en-GB-SoniaNeural
+EDGE_TTS_VOICE = "en-CA-ClaraNeural"
 
 # ─── SPEECH RECOGNITION ───────────────────────────────────────────────────────
 MIC_ENERGY_THRESHOLD  = 300    # Adjust up in noisy environments

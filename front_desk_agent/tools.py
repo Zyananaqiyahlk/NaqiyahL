@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 import config
+import db  # Postgres layer — falls back to JSON when DATABASE_URL is not set
 
 # ---------------------------------------------------------------------------
 # Storage helpers
@@ -53,13 +54,16 @@ def _save(path: Path, data: list) -> None:
 
 def log_visitor(name: str, purpose: str, host: str = "") -> str:
     """Record a visitor's arrival at the front desk."""
-    record = {
-        "id":         len(_load(VISITORS_FILE)) + 1,
-        "name":       name,
-        "purpose":    purpose,
-        "host":       host,
-        "arrived_at": datetime.now().isoformat(),
-    }
+    record = {"name": name, "purpose": purpose, "host": host}
+    pg_id = db.pg_insert("visitors", record)
+    if pg_id > 0:
+        return (
+            f"Visitor '{name}' logged (#{pg_id}). Purpose: {purpose}. "
+            + (f"Host notified: {host}." if host else "")
+        )
+    # JSON fallback
+    record["id"]         = len(_load(VISITORS_FILE)) + 1
+    record["arrived_at"] = datetime.now().isoformat()
     visitors = _load(VISITORS_FILE)
     visitors.append(record)
     _save(VISITORS_FILE, visitors)
@@ -72,14 +76,22 @@ def log_visitor(name: str, purpose: str, host: str = "") -> str:
 def take_message(sender_name: str, sender_contact: str, recipient: str, message_body: str) -> str:
     """Record a message for a staff member who is unavailable."""
     record = {
-        "id":           len(_load(MESSAGES_FILE)) + 1,
         "from_name":    sender_name,
         "from_contact": sender_contact,
-        "for":          recipient,
+        "for_staff":    recipient,
         "message":      message_body,
-        "received_at":  datetime.now().isoformat(),
-        "delivered":    False,
     }
+    pg_id = db.pg_insert("messages", record)
+    if pg_id > 0:
+        return (
+            f"Message from {sender_name} recorded for {recipient}. "
+            f"They'll be notified shortly. Message ID: #{pg_id}."
+        )
+    # JSON fallback
+    record["id"]          = len(_load(MESSAGES_FILE)) + 1
+    record["for"]         = recipient
+    record["received_at"] = datetime.now().isoformat()
+    record["delivered"]   = False
     messages = _load(MESSAGES_FILE)
     messages.append(record)
     _save(MESSAGES_FILE, messages)
@@ -127,22 +139,17 @@ def check_appointment(visitor_name: str, date: str = "") -> str:
 
 def book_appointment(visitor_name: str, host: str, date: str, time: str, purpose: str = "") -> str:
     """Book an in-person appointment for a visitor."""
-    record = {
-        "id":           len(_load(APPOINTMENTS_FILE)) + 1,
-        "visitor_name": visitor_name,
-        "host":         host,
-        "date":         date,
-        "time":         time,
-        "purpose":      purpose,
-        "booked_at":    datetime.now().isoformat(),
-    }
+    record = {"visitor_name": visitor_name, "host": host, "date": date, "time": time, "purpose": purpose}
+    pg_id = db.pg_insert("appointments", record)
+    if pg_id > 0:
+        return f"Appointment booked for {visitor_name} with {host} on {date} at {time}. Appointment ID: #{pg_id}."
+    # JSON fallback
+    record["id"]        = len(_load(APPOINTMENTS_FILE)) + 1
+    record["booked_at"] = datetime.now().isoformat()
     appts = _load(APPOINTMENTS_FILE)
     appts.append(record)
     _save(APPOINTMENTS_FILE, appts)
-    return (
-        f"Appointment booked for {visitor_name} with {host} on {date} at {time}. "
-        f"Appointment ID: #{record['id']}."
-    )
+    return f"Appointment booked for {visitor_name} with {host} on {date} at {time}. Appointment ID: #{record['id']}."
 
 
 def get_faq_answer(topic: str) -> str:
@@ -173,17 +180,20 @@ def capture_lead(
     interest_level: hot | warm | cold
     """
     record = {
-        "id":             len(_load(LEADS_FILE)) + 1,
-        "name":           name,
-        "company":        company,
-        "phone":          phone,
-        "email":          email,
-        "industry":       industry,
-        "interest_level": interest_level,
-        "status":         "New",
-        "notes":          notes,
-        "captured_at":    datetime.now().isoformat(),
+        "name": name, "company": company, "phone": phone,
+        "email": email, "industry": industry,
+        "interest_level": interest_level, "status": "New", "notes": notes,
     }
+    pg_id = db.pg_insert("leads", record)
+    if pg_id > 0:
+        return (
+            f"Lead captured: {name} from {company} (#{pg_id}). "
+            f"Interest: {interest_level}. "
+            + (f"Notes: {notes}" if notes else "")
+        )
+    # JSON fallback
+    record["id"]          = len(_load(LEADS_FILE)) + 1
+    record["captured_at"] = datetime.now().isoformat()
     leads = _load(LEADS_FILE)
     leads.append(record)
     _save(LEADS_FILE, leads)
@@ -249,8 +259,8 @@ def get_pipeline_stats() -> str:
     Return a quick summary of the current lead pipeline.
     Used by owner mode so Naqiyah can ask 'what's the pipeline looking like?'
     """
-    leads = _load(LEADS_FILE)
-    appts = _load(APPOINTMENTS_FILE)
+    leads = db.pg_fetch("leads") or _load(LEADS_FILE)
+    appts = db.pg_fetch("appointments") or _load(APPOINTMENTS_FILE)
     if not leads:
         return "No leads captured yet. Time to get those outreach calls going!"
 
@@ -356,6 +366,239 @@ def get_today_schedule(lookahead_days: int = 1) -> str:
     result = f"Calendar ({len(upcoming)} event{'s' if len(upcoming)!=1 else ''}, synced {synced[:10]}):\n"
     result += "\n".join(lines)
     return result
+
+
+# ===========================================================================
+# APOLLO TOOLS (lead search + enrichment)
+# ===========================================================================
+
+def import_leads_csv(file_path: str) -> str:
+    """
+    Import leads from a CSV file (e.g. exported from Apollo, LinkedIn, or any spreadsheet).
+    Skips duplicates. Adds all new contacts to the pipeline.
+
+    Apollo export steps:
+      1. app.apollo.io → Search → filter by industry/location/title
+      2. Select contacts → Export → CSV
+      3. Save the CSV anywhere on your computer
+      4. Tell Zara: "Import leads from /path/to/file.csv"
+    """
+    import csv
+    from pathlib import Path as _Path
+
+    path = _Path(file_path.strip())
+    if not path.exists():
+        return f"File not found: {file_path}. Make sure the path is correct."
+
+    # Map common CSV column names (Apollo, LinkedIn, etc.) to our fields
+    FIELD_MAP = {
+        "first name":   "first_name",  "last name": "last_name",
+        "name":         "name",        "full name": "name",
+        "title":        "title",       "job title": "title",
+        "company":      "company",     "company name": "company",
+        "account name": "company",
+        "email":        "email",       "email address": "email",
+        "phone":        "phone",       "phone number": "phone",  "mobile phone": "phone",
+        "industry":     "industry",
+        "city":         "city",        "state": "state",
+        "linkedin url": "linkedin",    "person linkedin url": "linkedin",
+        "employees":    "employees",   "# employees": "employees",
+        "website":      "website",
+    }
+
+    leads   = db.pg_fetch("leads") or _load(LEADS_FILE)
+    added   = 0
+    skipped = 0
+
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Normalise column names to lowercase
+                norm = {k.lower().strip(): v.strip() for k, v in row.items() if v and v.strip()}
+
+                # Build a unified record
+                rec: dict = {}
+                for csv_col, our_field in FIELD_MAP.items():
+                    if csv_col in norm and norm[csv_col]:
+                        rec[our_field] = norm[csv_col]
+
+                # Handle split first/last name
+                if "name" not in rec and ("first_name" in rec or "last_name" in rec):
+                    rec["name"] = f"{rec.pop('first_name', '')} {rec.pop('last_name', '')}".strip()
+                elif "first_name" in rec:
+                    rec.pop("first_name", None)
+                    rec.pop("last_name", None)
+
+                # Combine city + state into location
+                city  = rec.pop("city",  "")
+                state = rec.pop("state", "")
+                if city or state:
+                    rec["location"] = ", ".join(x for x in [city, state] if x)
+
+                if not rec.get("name"):
+                    skipped += 1
+                    continue
+
+                # Deduplicate by email or name+company
+                email   = rec.get("email", "")
+                name    = rec.get("name", "")
+                company = rec.get("company", "")
+                already = any(
+                    (email and l.get("email") == email) or
+                    (l.get("name", "").lower() == name.lower()
+                     and l.get("company", "").lower() == company.lower())
+                    for l in leads
+                )
+                if already:
+                    skipped += 1
+                    continue
+
+                rec.update({"status": "New", "source": "CSV Import", "interest_level": "cold"})
+
+                pg_id = db.pg_insert("leads", rec)
+                if pg_id <= 0:
+                    # JSON fallback
+                    rec["id"]          = len(leads) + 1
+                    rec["captured_at"] = datetime.now().isoformat()
+                    leads.append(rec)
+                    _save(LEADS_FILE, leads)
+                else:
+                    leads.append(rec)  # keep local list in sync for dedup check
+
+                added += 1
+
+    except Exception as e:
+        return f"Error reading CSV: {e}"
+
+    return (
+        f"CSV import complete. Added {added} new leads to pipeline"
+        + (f", skipped {skipped} duplicates." if skipped else ".")
+        + f" File: {path.name}"
+    )
+
+
+def search_apollo_leads(
+    industry: str = "",
+    title: str    = "",
+    location: str = "",
+    limit: int    = 10,
+) -> str:
+    """
+    Search Apollo.io for prospects matching industry/title/location and
+    add new ones to the local leads pipeline.
+    """
+    try:
+        from apollo_client import search_prospects
+        prospects = search_prospects(industry=industry, title=title, location=location, limit=limit)
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        return f"Apollo search failed: {e}"
+
+    if not prospects:
+        return "No prospects found for those criteria. Try broader terms — e.g. 'dental' instead of 'dental clinic'."
+
+    leads  = _load(LEADS_FILE)
+    added  = 0
+    for p in prospects:
+        already = any(
+            (p["email"] and l.get("email") == p["email"]) or
+            (l.get("name", "").lower() == p["name"].lower()
+             and l.get("company", "").lower() == p["company"].lower())
+            for l in leads
+        )
+        if not already and p["name"]:
+            leads.append({
+                "id":             len(leads) + 1,
+                "name":           p["name"],
+                "company":        p["company"],
+                "phone":          p.get("phone", ""),
+                "email":          p.get("email", ""),
+                "industry":       p.get("industry", industry),
+                "title":          p.get("title", ""),
+                "linkedin":       p.get("linkedin", ""),
+                "location":       p.get("location", ""),
+                "employees":      str(p.get("employees", "")),
+                "status":         "New",
+                "source":         "Apollo",
+                "interest_level": "cold",
+                "captured_at":    datetime.now().isoformat(),
+            })
+            added += 1
+
+    _save(LEADS_FILE, leads)
+
+    top   = prospects[:5]
+    lines = [
+        f"{p['name']} — {p['title']} at {p['company']}"
+        + (f" ({p['location']})" if p.get("location") else "")
+        for p in top
+    ]
+    summary  = f"Apollo search complete. Found {len(prospects)} prospects, added {added} new leads.\n"
+    summary += "\n".join(lines)
+    if len(prospects) > 5:
+        summary += f"\n…and {len(prospects) - 5} more in pipeline."
+    return summary
+
+
+def enrich_lead_apollo(
+    name:    str,
+    email:   str = "",
+    company: str = "",
+) -> str:
+    """
+    Enrich a captured lead with Apollo data: job title, LinkedIn, phone,
+    company size, industry, and seniority level.
+    Updates the lead record in the local file.
+    """
+    try:
+        from apollo_client import enrich_person
+        data = enrich_person(name=name, email=email, company=company)
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        return f"Apollo enrichment failed: {e}"
+
+    if not data:
+        return (
+            f"No Apollo profile found for {name}"
+            + (f" at {company}" if company else "")
+            + ". Lead saved with basic info — try enriching after you have their email."
+        )
+
+    # Update existing lead record
+    leads   = _load(LEADS_FILE)
+    updated = False
+    for lead in leads:
+        name_match  = lead.get("name", "").lower() == name.lower()
+        email_match = email and lead.get("email", "") == email
+        if name_match or email_match:
+            lead.update({
+                "title":       data.get("title",       lead.get("title", "")),
+                "linkedin":    data.get("linkedin",    lead.get("linkedin", "")),
+                "phone":       data.get("phone",       lead.get("phone", "")),
+                "email":       data.get("email",       lead.get("email", "")),
+                "industry":    data.get("industry",    lead.get("industry", "")),
+                "employees":   str(data.get("employees", "")),
+                "seniority":   data.get("seniority",   ""),
+                "enriched_at": datetime.now().isoformat(),
+                "enriched_by": "Apollo",
+            })
+            updated = True
+            break
+
+    if updated:
+        _save(LEADS_FILE, leads)
+
+    return (
+        f"Lead enriched via Apollo: {data['name']} — "
+        f"{data.get('title', 'Unknown title')} at {data.get('company', company)} "
+        f"({data.get('employees', '?')} employees, {data.get('industry', 'unknown industry')}). "
+        f"Email: {data.get('email') or 'not found'}. "
+        f"Phone: {data.get('phone') or 'not found'}. "
+        f"LinkedIn: {data.get('linkedin') or 'not found'}."
+    )
 
 
 def draft_followup_email(
@@ -556,6 +799,42 @@ TOOL_DEFINITIONS = [
             "required": [],
         },
     },
+    # ── Apollo tools ───────────────────────────────────────────────────────
+    {
+        "name": "search_apollo_leads",
+        "description": (
+            "Search Apollo.io for prospects by industry, job title, and/or location. "
+            "Automatically adds new contacts to the local leads pipeline. "
+            "Use in outreach mode when Naqiyah asks to find leads in a specific niche or city."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "industry": {"type": "string", "description": "e.g. 'real estate', 'dental', 'e-commerce', 'restaurants'"},
+                "title":    {"type": "string", "description": "e.g. 'founder', 'owner', 'marketing director'"},
+                "location": {"type": "string", "description": "e.g. 'Toronto', 'Ontario', 'Canada'"},
+                "limit":    {"type": "integer", "description": "Max results to return (1–25). Default 10."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "enrich_lead_apollo",
+        "description": (
+            "Enrich a captured lead with Apollo data: job title, LinkedIn URL, phone, "
+            "company size, and industry. Call this right after capture_lead when you "
+            "have their name and/or email."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name":    {"type": "string", "description": "Full name of the lead"},
+                "email":   {"type": "string", "description": "Email address (optional but improves match accuracy)"},
+                "company": {"type": "string", "description": "Company name (optional)"},
+            },
+            "required": ["name"],
+        },
+    },
     {
         "name": "draft_followup_email",
         "description": "Compose a personalised follow-up email draft for a prospect after a call or visit.",
@@ -568,6 +847,24 @@ TOOL_DEFINITIONS = [
                 "next_step":     {"type": "string", "description": "Agreed next action, e.g. 'book a discovery call'"},
             },
             "required": ["prospect_name", "company", "call_outcome"],
+        },
+    },
+    {
+        "name": "import_leads_csv",
+        "description": (
+            "Import a batch of leads from a CSV file exported from Apollo.io, LinkedIn Sales Navigator, "
+            "or any spreadsheet. Automatically deduplicates and saves to the pipeline. "
+            "Use when Naqiyah provides a file path or says 'import leads from CSV / spreadsheet / Apollo export'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Full path to the CSV file, e.g. ~/Downloads/apollo_export.csv",
+                },
+            },
+            "required": ["file_path"],
         },
     },
 ]
@@ -584,8 +881,11 @@ TOOL_REGISTRY = {
     "book_discovery_call": book_discovery_call,
     "get_pipeline_stats":  get_pipeline_stats,
     "get_daily_standup":   get_daily_standup,
-    "draft_followup_email": draft_followup_email,
-    "get_today_schedule":   get_today_schedule,
+    "draft_followup_email":  draft_followup_email,
+    "get_today_schedule":    get_today_schedule,
+    "search_apollo_leads":   search_apollo_leads,
+    "enrich_lead_apollo":    enrich_lead_apollo,
+    "import_leads_csv":      import_leads_csv,
 }
 
 

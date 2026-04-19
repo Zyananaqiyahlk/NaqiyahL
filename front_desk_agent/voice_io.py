@@ -1,18 +1,26 @@
 """
 Voice I/O layer — microphone input (STT) and speaker output (TTS).
 
-TTS priority: ElevenLabs (natural, expressive) → gTTS (online) → pyttsx3 (offline).
+TTS priority: Edge TTS (free, neural quality) → gTTS (online) → pyttsx3 (offline).
 STT:          Google Speech Recognition → offline Sphinx fallback.
+
+Edge TTS uses Microsoft's neural voices — same engine behind Windows 11 and
+Microsoft products. No API key, no account, no cost. Quality is close to ElevenLabs.
 """
 
+import asyncio
 import os
-import sys
 import tempfile
 from typing import Optional
 
 import speech_recognition as sr
 
 import config
+
+# Best Canadian/North American English voices from Edge TTS
+# Full list: run `edge-tts --list-voices` in your terminal
+EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "en-CA-ClaraNeural")  # warm, professional female
+
 
 # ---------------------------------------------------------------------------
 # Text-to-Speech — public entry point
@@ -22,59 +30,51 @@ def speak(text: str) -> None:
     """Convert text to speech and play it aloud. Always prints text too."""
     print(f"\n[{config.AGENT_NAME}]: {text}\n")
 
-    engine = config.TTS_ENGINE.lower()
-    if engine == "elevenlabs":
-        success = _speak_elevenlabs(text)
-        if not success:
-            _speak_gtts(text)
-    elif engine == "gtts":
-        _speak_gtts(text)
-    else:
+    success = _speak_edge(text)
+    if not success:
+        success = _speak_gtts(text)
+    if not success:
         _speak_pyttsx3(text)
 
 
 # ---------------------------------------------------------------------------
-# ElevenLabs TTS — best voice quality, requires API key
+# Edge TTS — free neural voices, no API key required
 # ---------------------------------------------------------------------------
 
-def _speak_elevenlabs(text: str) -> bool:
+def _speak_edge(text: str) -> bool:
     """
-    Stream audio from ElevenLabs and play it via pygame.
-    Returns True on success, False on any error (caller will fall back to gTTS).
-    Set ELEVENLABS_API_KEY in your .env file.
-    """
-    api_key = os.getenv("ELEVENLABS_API_KEY", "")
-    if not api_key:
-        return False
+    Use Microsoft Edge TTS (edge-tts package) for high-quality neural speech.
+    Free, no account needed. Falls back gracefully if not installed.
 
+    Install: pip install edge-tts
+    List voices: edge-tts --list-voices
+    Good voices for Zara:
+      en-CA-ClaraNeural    — Canadian English, warm female (default)
+      en-US-JennyNeural    — US English, conversational female
+      en-GB-SoniaNeural    — British English, professional female
+      en-AU-NatashaNeural  — Australian English, friendly female
+    """
     try:
-        import requests
+        import edge_tts
         import pygame
 
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{config.ELEVENLABS_VOICE_ID}/stream"
-        headers = {
-            "xi-api-key": api_key,
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "text": text,
-            "model_id": config.ELEVENLABS_MODEL,
-            "voice_settings": {
-                "stability": config.ELEVENLABS_STABILITY,
-                "similarity_boost": config.ELEVENLABS_SIMILARITY,
-            },
-        }
+        async def _synthesise():
+            communicate = edge_tts.Communicate(text, EDGE_TTS_VOICE)
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                tmp_path = tmp.name
+            await communicate.save(tmp_path)
+            return tmp_path
 
-        response = requests.post(url, headers=headers, json=payload, stream=True, timeout=15)
-        if response.status_code != 200:
-            print(f"[ElevenLabs error]: HTTP {response.status_code}")
-            return False
-
-        # Write streamed audio to a temp file and play with pygame
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            for chunk in response.iter_content(chunk_size=4096):
-                tmp.write(chunk)
-            tmp_path = tmp.name
+        # Run the async call synchronously
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            tmp_path = loop.run_until_complete(_synthesise())
+        except RuntimeError:
+            # If there's already a running loop (e.g. inside async context)
+            tmp_path = asyncio.run(_synthesise())
 
         pygame.mixer.init()
         pygame.mixer.music.load(tmp_path)
@@ -86,9 +86,10 @@ def _speak_elevenlabs(text: str) -> bool:
         return True
 
     except ImportError:
+        # edge-tts not installed — silent fallback
         return False
     except Exception as exc:
-        print(f"[ElevenLabs error]: {exc} — falling back to gTTS")
+        print(f"[Edge TTS error]: {exc} — falling back to gTTS")
         return False
 
 
@@ -96,8 +97,8 @@ def _speak_elevenlabs(text: str) -> bool:
 # gTTS — good quality, requires internet
 # ---------------------------------------------------------------------------
 
-def _speak_gtts(text: str) -> None:
-    """Use gTTS (Google Text-to-Speech) + pygame to play audio."""
+def _speak_gtts(text: str) -> bool:
+    """Use gTTS (Google Text-to-Speech) + pygame. Returns True on success."""
     try:
         from gtts import gTTS
         import pygame
@@ -114,20 +115,21 @@ def _speak_gtts(text: str) -> None:
             pygame.time.Clock().tick(10)
         pygame.mixer.music.unload()
         os.unlink(tmp_path)
+        return True
 
     except ImportError:
-        _speak_pyttsx3(text)
+        return False
     except Exception as exc:
-        print(f"[gTTS error]: {exc}")
-        _speak_pyttsx3(text)
+        print(f"[gTTS error]: {exc} — falling back to pyttsx3")
+        return False
 
 
 # ---------------------------------------------------------------------------
-# pyttsx3 — fully offline fallback
+# pyttsx3 — fully offline fallback, no internet required
 # ---------------------------------------------------------------------------
 
 def _speak_pyttsx3(text: str) -> None:
-    """Use pyttsx3 for fully offline TTS — no internet required."""
+    """Offline TTS using pyttsx3. Robotic but works everywhere."""
     try:
         import pyttsx3
         engine = pyttsx3.init()
@@ -137,7 +139,7 @@ def _speak_pyttsx3(text: str) -> None:
         engine.runAndWait()
         engine.stop()
     except Exception as exc:
-        print(f"[pyttsx3 error]: {exc} — text only mode.")
+        print(f"[pyttsx3 error]: {exc} — text-only mode.")
 
 
 # ---------------------------------------------------------------------------

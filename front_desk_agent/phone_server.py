@@ -24,7 +24,7 @@ Point Twilio number → voice webhook → https://<ngrok-url>/voice
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 from dotenv import load_dotenv
 from flask import Flask, request, Response, jsonify
@@ -43,9 +43,13 @@ PORT                  = int(os.environ.get("PORT", 5001))
 HOST                  = os.environ.get("HOST", "0.0.0.0")
 OWNER_PHONE_NUMBER    = os.environ.get("OWNER_PHONE_NUMBER", "")  # your personal cell
 DEFAULT_INBOUND_MODE  = os.environ.get("DEFAULT_INBOUND_MODE", "visitor")  # visitor | outreach | owner
+RAILWAY_PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", f"http://localhost:{PORT}")
+API_SECRET            = os.environ.get("API_SECRET", "")  # set this on Railway for REST API auth
+TWILIO_ACCOUNT_SID    = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN     = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER    = os.environ.get("TWILIO_FROM_NUMBER", "")  # your Twilio phone number
 
-# Twilio voice that reads Zara's replies. For higher quality,
-# upgrade to ElevenLabs via <Play> — noted in docstring.
+# Twilio voice that reads Zara's replies.
 TTS_VOICE             = os.environ.get("TWILIO_TTS_VOICE", "Polly.Joanna-Neural")
 
 # ---------------------------------------------------------------------------
@@ -283,43 +287,46 @@ def sim_chat() -> Response:
         SIM_SESSIONS[key] = FrontDeskAssistant(text_mode=True, mode=mode)
     session = SIM_SESSIONS[key]
 
-    # Track tool calls for this turn so we can show them in the UI
+    # Track tool calls for this turn.
+    # IMPORTANT: patch at the `assistant` module level — that's where _chat() resolves
+    # execute_tool from. Patching `tools.execute_tool` alone doesn't work because
+    # assistant.py already has a direct reference bound at import time.
     tool_calls_made: list[dict] = []
-    original_execute = None
+
+    import assistant as _assistant_module
+    import tools     as _tools_module
+    from tools import execute_tool as _orig_execute
+
+    def _tracking_execute(name: str, tool_input: dict) -> str:
+        result = _orig_execute(name, tool_input)
+        tool_calls_made.append({
+            "name":   name,
+            "input":  tool_input,
+            "result": result[:300] + ("…" if len(result) > 300 else ""),
+        })
+        return result
+
+    # Patch both the tools module AND assistant's local reference
+    _tools_module.execute_tool    = _tracking_execute
+    _assistant_module.execute_tool = _tracking_execute
+
     try:
-        # Monkey-patch execute_tool to capture invocations
-        from tools import execute_tool as _orig
-        original_execute = _orig
-
-        def _tracking_execute(name: str, tool_input: dict) -> str:
-            result = _orig(name, tool_input)
-            tool_calls_made.append({
-                "name":   name,
-                "input":  tool_input,
-                "result": result[:300] + ("…" if len(result) > 300 else ""),
-            })
-            return result
-
-        import tools
-        tools.execute_tool = _tracking_execute
-
         reply = session._chat(message)
     except Exception as e:
         return jsonify({
-            "error": str(e),
+            "error":      str(e),
             "error_type": type(e).__name__,
         }), 500
     finally:
-        # Restore original execute_tool
-        if original_execute is not None:
-            import tools
-            tools.execute_tool = original_execute
+        # Always restore — even if _chat raises
+        _tools_module.execute_tool    = _orig_execute
+        _assistant_module.execute_tool = _orig_execute
 
     return jsonify({
-        "reply":       reply,
-        "mode":        session.mode,     # may have auto-switched via passphrase
-        "tool_calls":  tool_calls_made,
-        "turn_count":  len([m for m in session.conversation_history if m["role"] == "user"]),
+        "reply":      reply,
+        "mode":       session.mode,
+        "tool_calls": tool_calls_made,
+        "turn_count": len([m for m in session.conversation_history if m["role"] == "user"]),
     })
 
 
@@ -614,6 +621,221 @@ greet();
 # ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
+
+# ===========================================================================
+# TWILIO OUTBOUND — Zara dials a prospect
+# ===========================================================================
+
+@app.route("/outbound", methods=["POST"])
+def outbound_call() -> Response:
+    """
+    Tell Zara to call a prospect via Twilio.
+
+    POST body (JSON):
+      {
+        "phone_number":  "+14165551234",  required
+        "prospect_name": "Jane Smith",    optional — logged for context
+        "company":       "Smith Dental",  optional
+        "api_key":       "your-secret"    required if API_SECRET is set in env
+      }
+
+    Flow:
+      1. Twilio places the call from your TWILIO_FROM_NUMBER
+      2. When the prospect answers, Twilio hits /voice?mode=outreach
+      3. Zara runs the outreach conversation (qualify → book discovery call)
+      4. Transcript saved to data/conversations/ when call ends
+    """
+    data   = request.get_json(silent=True) or {}
+    secret = data.get("api_key", "")
+
+    if API_SECRET and secret != API_SECRET:
+        return jsonify({"error": "Unauthorized — provide api_key in body"}), 401
+
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_FROM_NUMBER:
+        return jsonify({
+            "error": (
+                "Twilio not fully configured. "
+                "Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER in your environment."
+            )
+        }), 500
+
+    phone = data.get("phone_number", "").strip()
+    if not phone:
+        return jsonify({"error": "phone_number is required"}), 400
+
+    prospect = data.get("prospect_name", "")
+    company  = data.get("company", "")
+    print(f"📞  Dialling {prospect or phone} ({company}) → outreach mode")
+
+    try:
+        from twilio.rest import Client as TwilioClient
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        call   = client.calls.create(
+            to              = phone,
+            from_           = TWILIO_FROM_NUMBER,
+            url             = f"{RAILWAY_PUBLIC_DOMAIN}/voice?mode=outreach",
+            status_callback = f"{RAILWAY_PUBLIC_DOMAIN}/status",
+            status_callback_method = "POST",
+        )
+        print(f"✅  Call initiated — SID: {call.sid}")
+        return jsonify({"ok": True, "call_sid": call.sid, "to": phone, "status": call.status})
+    except Exception as e:
+        print(f"❌  Twilio outbound error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ===========================================================================
+# REST API — trigger Zara from Make.com / Zapier / external systems
+# ===========================================================================
+
+def _require_auth(req) -> Optional[Response]:
+    """Return 401 response if API_SECRET is set and the request doesn't match."""
+    if not API_SECRET:
+        return None
+    provided = (
+        req.headers.get("X-API-Key", "")
+        or (req.get_json(silent=True) or {}).get("api_key", "")
+    )
+    if provided != API_SECRET:
+        return jsonify({"error": "Unauthorized — set X-API-Key header or api_key in body"}), 401
+    return None
+
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat() -> Response:
+    """
+    Send a message to Zara and get her reply.
+    Use this from Make.com, Zapier, or any webhook source.
+
+    POST body:
+      { "message": "...", "mode": "visitor|outreach|owner", "session_id": "...", "api_key": "..." }
+    """
+    auth_err = _require_auth(request)
+    if auth_err:
+        return auth_err
+
+    data       = request.get_json(silent=True) or {}
+    session_id = data.get("session_id", "api_default")
+    mode       = data.get("mode", "visitor")
+    message    = (data.get("message") or "").strip()
+
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+
+    key = f"api_{session_id}_{mode}"
+    if key not in SIM_SESSIONS:
+        SIM_SESSIONS[key] = FrontDeskAssistant(text_mode=True, mode=mode)
+    session = SIM_SESSIONS[key]
+
+    try:
+        reply = session._chat(message)
+    except Exception as e:
+        return jsonify({"error": str(e), "type": type(e).__name__}), 500
+
+    return jsonify({
+        "reply":      reply,
+        "mode":       session.mode,
+        "session_id": session_id,
+        "turns":      len([m for m in session.conversation_history if m["role"] == "user"]),
+    })
+
+
+@app.route("/api/leads", methods=["GET"])
+def api_leads() -> Response:
+    """Return all captured leads as JSON. Use for syncing to a CRM or spreadsheet."""
+    auth_err = _require_auth(request)
+    if auth_err:
+        return auth_err
+
+    from tools import _load, LEADS_FILE
+    leads = _load(LEADS_FILE)
+    return jsonify({"count": len(leads), "leads": leads})
+
+
+@app.route("/api/pipeline", methods=["GET"])
+def api_pipeline() -> Response:
+    """
+    Return a complete snapshot of all data Zara has saved — across ALL modes
+    (browser sim, CLI, phone calls). No auth required for easy checking.
+    """
+    from tools import _load, LEADS_FILE, VISITORS_FILE, APPOINTMENTS_FILE, MESSAGES_FILE
+    leads   = _load(LEADS_FILE)
+    visitors = _load(VISITORS_FILE)
+    appts   = _load(APPOINTMENTS_FILE)
+    messages = _load(MESSAGES_FILE)
+    return jsonify({
+        "summary": {
+            "leads":        len(leads),
+            "visitors":     len(visitors),
+            "appointments": len(appts),
+            "messages":     len(messages),
+        },
+        "leads":        leads,
+        "visitors":     visitors,
+        "appointments": appts,
+        "messages":     messages,
+    })
+
+
+@app.route("/api/standup", methods=["GET"])
+def api_standup() -> Response:
+    """Return today's standup priorities — pipe this to Slack, email, or Notion."""
+    auth_err = _require_auth(request)
+    if auth_err:
+        return auth_err
+
+    from tools import get_daily_standup
+    return jsonify({"standup": get_daily_standup()})
+
+
+@app.route("/api/apollo/search", methods=["POST"])
+def api_apollo_search() -> Response:
+    """
+    Trigger an Apollo lead search via REST.
+
+    POST body:
+      { "industry": "dental", "title": "owner", "location": "Toronto", "limit": 10, "api_key": "..." }
+    """
+    auth_err = _require_auth(request)
+    if auth_err:
+        return auth_err
+
+    from tools import search_apollo_leads
+    data   = request.get_json(silent=True) or {}
+    result = search_apollo_leads(
+        industry = data.get("industry", ""),
+        title    = data.get("title", ""),
+        location = data.get("location", ""),
+        limit    = int(data.get("limit", 10)),
+    )
+    return jsonify({"result": result})
+
+
+@app.route("/api/apollo/enrich", methods=["POST"])
+def api_apollo_enrich() -> Response:
+    """
+    Enrich a lead via Apollo.
+
+    POST body:
+      { "name": "Jane Smith", "email": "jane@example.com", "company": "Smith Dental", "api_key": "..." }
+    """
+    auth_err = _require_auth(request)
+    if auth_err:
+        return auth_err
+
+    from tools import enrich_lead_apollo
+    data   = request.get_json(silent=True) or {}
+    name   = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+
+    result = enrich_lead_apollo(
+        name    = name,
+        email   = data.get("email", ""),
+        company = data.get("company", ""),
+    )
+    return jsonify({"result": result})
+
 
 if __name__ == "__main__":
     print("=" * 62)

@@ -1,18 +1,12 @@
 anthropic>=0.40.0
-SpeechRecognition>=3.10.0
-pyttsx3>=2.90
-gTTS>=2.5.0
-pygame>=2.5.0
-pyaudio>=0.2.13
 python-dotenv>=1.0.0
-requests>=2.31.0       # Apollo API calls
-edge-tts>=6.1.0        # Free Microsoft neural TTS — no API key needed
+requests>=2.31.0
 
-# ─── Phone server (Twilio inbound + Bland.ai outbound) ──────────────────────
+# ─── Phone server (Twilio inbound + outbound) ───────────────────────────────
 flask>=3.0.0
 twilio>=9.0.0
-gunicorn>=21.2.0       # Production WSGI server for Railway deployment
-psycopg2-binary>=2.9.9 # Postgres driver — Railway provides DATABASE_URL automatically
+gunicorn>=21.2.0
+psycopg2-binary>=2.9.9
 
 # ─── Google Calendar sync ────────────────────────────────────────────────────
 google-api-python-client>=2.100.0

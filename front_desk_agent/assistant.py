@@ -23,7 +23,18 @@ from dotenv import load_dotenv
 
 import config
 from tools import TOOL_DEFINITIONS, execute_tool
-from voice_io import speak, listen, listen_with_retry
+
+try:
+    from voice_io import speak, listen, listen_with_retry
+    _VOICE_AVAILABLE = True
+except ImportError:
+    _VOICE_AVAILABLE = False
+    def speak(text: str) -> None:
+        print(f"\n[{config.AGENT_NAME}]: {text}\n")
+    def listen(prompt=None):
+        return None
+    def listen_with_retry(prompt=None, max_attempts=3):
+        return None
 
 load_dotenv(override=True)  # override=True ensures .env beats any stale shell exports
 
